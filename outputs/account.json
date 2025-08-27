@@ -1,0 +1,22 @@
+{
+    "GithubActionsAccess_role_arn": {
+      "sensitive": false,
+      "type": "string",
+      "value": "arn:aws:iam::111111111111:role/GithubActionsAccess"
+    },
+    "TerraformAwsProvider_role_arn": {
+      "sensitive": false,
+      "type": "string",
+      "value": "arn:aws:iam::111111111111:role/TerraformAwsProvider"
+    },
+    "aws_account_arn": {
+      "sensitive": false,
+      "type": "string",
+      "value": "arn:aws:organizations::222222222222:account/o-xxxxxxxxxx/111111111111"
+    },
+    "aws_account_id": {
+      "sensitive": false,
+      "type": "string",
+      "value": "111111111111"
+    }
+  }

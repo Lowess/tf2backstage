@@ -1,0 +1,228 @@
+{# ----------------- config from env (no leading blank lines) ----------------- -#}
+
+{# Terraform output parsing variables #}
+{%- set output_key       = env("OUTPUT_KEY") -%}
+{%- set exclude_re       = env("OUTPUT_EXCLUDE_RE", "") -%}
+{%- set include_re       = env("OUTPUT_INCLUDE_RE", "") -%}
+{%- set omit_null        = (env("OUTPUT_OMIT_NULL", "")|lower in ["1","true","yes","y"]) -%}
+{%- set safe_key_length  = (env("OUTPUT_SAFE_KEY_LENGTH", "true")|lower in ["1","true","yes","y"]) -%}
+
+{# Backstage Resource metadata & spec variables #}
+{%- set name_spec        = env("NAME", "") -%}
+{%- set description      = env("DESCRIPTION", "Resource generated from Terraform output") -%}
+{%- set tags_spec        = env("TAGS", "") -%}
+{%- set owner            = env("OWNER", "devops") -%}
+{%- set system           = env("SYSTEM", "default") -%}
+{%- set type             = env("TYPE", "terraform-output") -%}
+{%- set ann_prefix       = env("ANN_PREFIX", "gumgum.com") -%}
+
+{# ----------------- helpers ----------------- -#}
+
+{#
+  ANNOTATION KEY LENGTH LIMITATIONS & STRATEGIES
+
+  Backstage follows Kubernetes annotation key rules:
+  - Format: [prefix/]name where prefix is a domain (≤253 chars)
+  - Only ONE slash allowed (between prefix and name)
+  - Name part must be ≤63 characters, [a-zA-Z0-9] separated by [-_.]
+
+  IMPLEMENTED STRATEGIES:
+
+  1. SAFE TRUNCATION (OUTPUT_SAFE_KEY_LENGTH=true, default enabled):
+     - Truncates to 55 chars + "." + length + last 4 chars
+     - Example: "very.long.key.name.that.exceeds.limit" → "very.long.key.name.that.exc.67name"
+     - Preserves uniqueness with length+suffix
+
+  2. FILTERING (combine with include/exclude regex):
+     - Use OUTPUT_INCLUDE_RE to only include specific patterns
+     - Use OUTPUT_EXCLUDE_RE to remove problematic long keys
+
+  ALTERNATIVE STRATEGIES (not implemented, for reference):
+  - Hash-based: Use MD5/SHA hash for name part when too long
+  - Hierarchical prefixes: Move parts of path into domain prefix
+  - Manual mapping: Use env vars to define custom key mappings
+  - Custom abbreviations: Replace with regex-based patterns if needed
+
+  CONFIGURATION:
+  - Set OUTPUT_SAFE_KEY_LENGTH=false to allow long keys (may be rejected)
+  - Use include/exclude regex for precise control over which keys to process
+#}
+
+{%- macro safe_annotation_key(prefix, name_part) -%}
+{%- if safe_key_length -%}
+  {%- set max_name_length = 63 -%}
+  {%- if name_part|length <= max_name_length -%}
+    {{- prefix ~ "/" ~ name_part -}}
+  {%- else -%}
+    {# Strategy 1: Truncate with suffix based on length and last chars #}
+    {%- set truncated = name_part[:55] -%}
+    {%- set suffix_chars = name_part[-4:] -%}
+    {%- set length_str = name_part|length|string -%}
+    {{- prefix ~ "/" ~ truncated ~ "." ~ length_str ~ suffix_chars -}}
+  {%- endif -%}
+{%- else -%}
+  {{- prefix ~ "/" ~ name_part -}}
+{%- endif -%}
+{%- endmacro -%}
+
+
+{%- macro yaml_string(v) -%}
+{%- if v is boolean -%}"{{ "true" if v else "false" }}"
+{%- elif v is number -%}"{{ v }}"
+{%- elif v is none -%}"null"
+{%- else -%}"{{ (v|string).replace('\n','\\n').replace('"','\\"') }}"
+{%- endif -%}
+{%- endmacro -%}
+
+{%- macro flatten(rows_ns, node, prefix=[], custom_prefix=none) -%}
+  {%- set prefix_to_use = custom_prefix or ann_prefix -%}
+  {%- if node is mapping -%}
+    {%- for k, v in node|dictsort -%}
+      {{- flatten(rows_ns, v, prefix + [k], custom_prefix) -}}
+    {%- endfor -%}
+  {%- elif node is sequence and (node is not string) -%}
+    {%- for v in node -%}
+      {{- flatten(rows_ns, v, prefix + [loop.index0], custom_prefix) -}}
+    {%- endfor -%}
+  {%- else -%}
+    {%- if omit_null and node is none -%}{# skip nulls if requested #}{%- else -%}
+      {%- set keypath = prefix | map('string') | join('.') -%}
+      {%- if keypath and (exclude_re == "" or (keypath is not match(exclude_re))) and (include_re == "" or (keypath is match(include_re))) -%}
+        {%- set annotation_key = safe_annotation_key(prefix_to_use, keypath) -%}
+        {%- set _ = rows_ns.items.append(annotation_key ~ ": " ~ (yaml_string(node))) -%}
+      {%- endif -%}
+    {%- endif -%}
+  {%- endif -%}
+{%- endmacro -%}
+
+{%- macro process_output_value(rows_ns, value, base_prefix, key_name=none) -%}
+  {%- if value is mapping -%}
+    {# For mappings, flatten with base_prefix as domain and key_name as start of name part #}
+    {%- set flatten_prefix = base_prefix -%}
+    {{- flatten(rows_ns, value, ([key_name] if key_name else []), flatten_prefix) -}}
+  {%- else -%}
+    {# For single values, create one annotation with base_prefix/key_name #}
+    {%- if not (omit_null and value is none) -%}
+      {%- set annotation_key = safe_annotation_key(base_prefix, key_name) -%}
+      {%- set _ = rows_ns.items.append(annotation_key ~ ": " ~ (yaml_string(value))) -%}
+    {%- endif -%}
+  {%- endif -%}
+{%- endmacro -%}
+
+{%- macro get_by_path(root_obj, spec) -%}
+{# spec may look like:
+   "@cluster_name"
+   "@.cluster_name"
+   "@eks.cluster_name" (will work but usually you already selected OUTPUT_KEY=eks)
+   "@cluster_addons/aws-ebs-csi-driver/addon_version"
+   indexes like "@some.list/0/name" also work
+#}
+{%- set s = (spec or "") -%}
+{%- if s.startswith("@") -%}
+  {%- set s = s[1:] -%}
+{%- endif -%}
+{%- set s = s.lstrip("./") -%}
+{%- if not s -%}{{- none -}}{%- else -%}
+  {%- set cur = root_obj -%}
+  {%- for seg in s.replace(".", "/").split("/") if seg != "" -%}
+    {%- if cur is mapping -%}
+      {%- if seg in cur -%}{%- set cur = cur[seg] -%}{%- else -%}{{- none -}}{%- break -%}{%- endif -%}
+    {%- elif cur is sequence and (cur is not string) -%}
+      {%- if seg.isdigit() and (0 <= (seg|int) < cur|length) -%}
+        {%- set cur = cur[seg|int] -%}
+      {%- else -%}{{- none -}}{%- break -%}{%- endif -%}
+    {%- else -%}
+      {{- none -}}{%- break -%}
+    {%- endif -%}
+    {%- if loop.last -%}{{- cur -}}{%- endif -%}
+  {%- endfor -%}
+{%- endif -%}
+{%- endmacro -%}
+
+{# ----------------- select the output chunk ----------------- -#}
+{%- if output_key -%}
+  {%- set out = root.get(output_key) -%}
+  {%- set val = (out.value if out and "value" in out else none) -%}
+{%- else -%}
+  {%- set out = root -%}
+  {%- set val = root -%}
+{%- endif -%}
+
+{# ----------------- derive resource_name strictly per spec ----------------- -#}
+{%- set rn_resolved = none -%}
+{%- if name_spec and name_spec.startswith("@") -%}
+  {%- if output_key and val is mapping -%}
+    {# Specific output key - extract from val directly #}
+    {%- set rn_resolved = get_by_path(val, name_spec) -%}
+  {%- elif not output_key and root is mapping -%}
+    {# No output key - need to handle terraform output structure (key.value.field) #}
+    {%- set field_spec = name_spec[1:] -%}
+    {%- set parts = field_spec.split('.') -%}
+    {%- if parts|length >= 2 -%}
+      {%- set tf_key = parts[0] -%}
+      {%- set field_path = parts[1:] | join('.') -%}
+      {%- set tf_output = root.get(tf_key) -%}
+      {%- if tf_output and tf_output is mapping and "value" in tf_output -%}
+        {%- set rn_resolved = get_by_path(tf_output.value, "@" ~ field_path) -%}
+      {%- endif -%}
+    {%- endif -%}
+  {%- endif -%}
+{%- endif -%}
+
+{# Set final resource_name based on resolution results #}
+{%- if rn_resolved is string -%}
+  {%- set resource_name = rn_resolved -%}
+{%- elif name_spec and not name_spec.startswith("@") -%}
+  {%- set resource_name = name_spec -%}
+{%- else -%}
+  {%- set resource_name = (output_key or "terraform-outputs") -%}
+{%- endif -%}
+
+{# ----------------- derive tags list ----------------- -#}
+{%- if tags_spec -%}
+  {%- set tags_list = tags_spec.split(',') | map('trim') | list -%}
+{%- else -%}
+  {%- set tags_list = [output_key or "terraform"] -%}
+{%- endif -%}
+
+{# ----------------- collect annotations once ----------------- -#}
+{%- set rows = namespace(items=[]) -%}
+{%- if output_key and val is not none -%}
+  {# Process specific output key - include output_key in the name part #}
+  {{- process_output_value(rows, val, ann_prefix, output_key) -}}
+{%- elif not output_key and root is mapping -%}
+  {# Process all terraform outputs #}
+  {%- for key, output_obj in root.items() -%}
+    {%- if output_obj is mapping and "value" in output_obj -%}
+      {%- set keypath = key -%}
+      {%- if keypath and (exclude_re == "" or (keypath is not match(exclude_re))) and (include_re == "" or (keypath is match(include_re))) -%}
+        {{- process_output_value(rows, output_obj.value, ann_prefix, keypath) -}}
+      {%- endif -%}
+    {%- endif -%}
+  {%- endfor -%}
+{%- endif -%}
+
+{# ----------------- render Backstage entity YAML ----------------- -#}
+apiVersion: backstage.io/v1alpha1
+kind: Resource
+metadata:
+  name: {{ resource_name }}
+  description: {{ description }}
+  tags:
+{%- for tag in tags_list %}
+    - {{ tag }}
+{%- endfor %}
+  annotations:
+{%- if rows.items %}
+{{ rows.items | join('\n') | indent(4, true) }}
+{%- else %}
+  {%- if output_key %}
+    {{ safe_annotation_key(ann_prefix, "error") }}: "OUTPUT_KEY '{{ output_key }}' not found or has no 'value' in tf-output.json"
+  {%- else %}
+    {{ safe_annotation_key(ann_prefix, "error") }}: "No valid terraform outputs found in tf-output.json"
+  {%- endif %}
+{%- endif %}
+spec:
+  type: {{ type }}
+  owner: {{ owner }}
+  system: {{ system }}
